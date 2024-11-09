@@ -1,7 +1,7 @@
 from typing import Optional
 import requests
 from conversation_manager import ConversationManager
-from transcriber import WhisperTranscriber
+from transcriber import TranscriptionService, WhisperTranscriber
 from text_to_speech import TextToSpeech
 from prompt_processor import PromptProcessor
 
@@ -35,37 +35,37 @@ class VoiceAssistant:
         use_gpu: bool = False,
     ):
         self.llm_client = LLMClient(api_key)
-        self.transcriber = WhisperTranscriber()
+        self.transcriber = TranscriptionService()
         self.tts = TextToSpeech(use_gpu=use_gpu, model_path=tts_model_path, config_path=tts_config_path)
         self.conversation_history = []
         self.MAX_CLARIFICATION_TURNS = 3
 
-    def get_voice_input(self) -> Optional[str]:
+    async def get_voice_input(self) -> Optional[str]:
         """Record and transcribe voice input."""
-        result = self.transcriber.record_and_transcribe()
+        result = await self.transcriber.transcribe_speech()
         if not result.segments:
             return None
         return " ".join(segment.text for segment in result.segments)
 
-    def confirm_summary(self, summary: str) -> bool:
+    async def confirm_summary(self, summary: str) -> bool:
         """Ask for user confirmation of the summary."""
         confirmation_prompt = f"I understood that: {summary}. Is this correct?"
         self.tts.speak(confirmation_prompt)
         print(confirmation_prompt)
 
-        response = self.get_voice_input()
+        response = await self.get_voice_input()
         if not response:
             return False
 
         response = response.lower()
         return "yes" in response or "correct" in response
 
-    def process_voice_input(self) -> Optional[str]:
+    async def process_voice_input(self) -> Optional[str]:
         """Main processing loop for voice input and summary clarification."""
         print("Speak...")
 
         # Get initial input
-        question = self.get_voice_input()
+        question = await self.get_voice_input()
         if not question:
             print("No speech detected!")
             return None
@@ -94,7 +94,7 @@ class VoiceAssistant:
             {"role": "assistant", "content": confirmation_prompt}
         )
 
-        confirmation = self.get_voice_input()
+        confirmation = await self.get_voice_input()
         if not confirmation:
             return None
 
@@ -115,11 +115,11 @@ class VoiceAssistant:
         # If not confirmed, enter clarification loop
         for attempt in range(self.MAX_CLARIFICATION_TURNS):
             # Ask for clarification
-            confirmation_prompt = f"I understood that: {summary_data['statement']}. Is this correct?"
+            confirmation_prompt = f"I understood that your statement is: {summary_data['statement']}. Is this correct?"
             self.tts.speak(confirmation_prompt)
             print("Please clarify...")
 
-            clarification = self.get_voice_input()
+            clarification = await self.get_voice_input()
             if not clarification:
                 return None
 
@@ -144,7 +144,7 @@ class VoiceAssistant:
             self.tts.speak(confirmation_prompt)
             print(confirmation_prompt)
 
-            confirmation = self.get_voice_input()
+            confirmation = await self.get_voice_input()
             if not confirmation:
                 return None
 
