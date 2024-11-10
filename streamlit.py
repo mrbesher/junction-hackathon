@@ -12,10 +12,12 @@ from components import StatementDisplay
 
 RAG_URL = "http://127.0.0.1:5000/post-data"
 
+
 @dataclass
 class Message:
     content: str
     role: str
+
 
 @dataclass
 class Statement:
@@ -23,15 +25,14 @@ class Statement:
     votes: int = 0
     id: str = ""
 
+
 class RAGService:
-    """ RAG implementation"""
+    """RAG implementation"""
+
     def get_similar_statements(self, query: str) -> List[str]:
-        response = requests.post(
-                RAG_URL,
-                params={"text": query},  
-                timeout=10
-            )
+        response = requests.post(RAG_URL, params={"text": query}, timeout=10)
         return response.json()
+
 
 class SessionState:
     def __init__(self):
@@ -44,13 +45,14 @@ class SessionState:
         if "awaiting_confirmation" not in st.session_state:
             st.session_state.awaiting_confirmation = False
 
+
 class MultimodalPolisApp:
     def __init__(self):
         self.state = SessionState()
         self.voice_assistant = VoiceAssistant(
             api_key=st.secrets.get("openrouter_api_key"),
             tts_model_path="/home/besher/Documents/tools/piper/en_US-ljspeech-high.onnx",
-            tts_config_path="/home/besher/Documents/tools/piper/en_en_US_ljspeech_high_en_US-ljspeech-high.onnx.json"
+            tts_config_path="/home/besher/Documents/tools/piper/en_en_US_ljspeech_high_en_US-ljspeech-high.onnx.json",
         )
         self.rag_service = RAGService()
         self.statement_display = StatementDisplay()
@@ -59,7 +61,7 @@ class MultimodalPolisApp:
         """Process text input and generate response"""
         messages = [
             Message(role="system", content="You are a helpful assistant."),
-            Message(role="user", content=text_input)
+            Message(role="user", content=text_input),
         ]
 
         response = await self.voice_assistant.llm_client.get_response(messages)
@@ -71,25 +73,42 @@ class MultimodalPolisApp:
             ]
 
     async def handle_voice_interaction(self) -> None:
-        """Handle voice interaction and process response"""
-        with st.spinner("Listening..."):
-            final_statement = await self.voice_assistant.process_voice_input()
+        progress_container = st.empty()
 
-            if final_statement:
-                similar_statements = self.rag_service.get_similar_statements(final_statement)
-                st.session_state.current_suggestions = [
-                    Statement(text=stmt["text"], id= stmt["hit_id"]) for stmt in similar_statements
-                ]
-                st.session_state.messages.append({
-                    "role": "user",
-                    "content": final_statement
-                })
+        with progress_container:
+            final_statement, state = await self.voice_assistant.process_voice_input()
+
+            # Visual feedback based on state
+            if state == AssistantState.LISTENING:
+                st.info("🎤 " + state.value, icon="🎤")
+            elif state == AssistantState.PROCESSING:
+                st.warning("⚙️ " + state.value, icon="⚙️")
+            elif state == AssistantState.VERIFYING:
+                st.info("❓ " + state.value, icon="❓")
+            elif state == AssistantState.COMPLETED:
+                st.success("✅ " + state.value, icon="✅")
+                # Process final statement
+                if final_statement:
+                    similar_statements = self.rag_service.get_similar_statements(
+                        final_statement
+                    )
+                    st.session_state.current_suggestions = [
+                        Statement(text=stmt["text"], id=stmt["hit_id"])
+                        for stmt in similar_statements
+                    ]
+                    st.session_state.messages.append(
+                        {"role": "user", "content": final_statement}
+                    )
+            else:
+                st.error("❌ " + state.value, icon="❌")
 
     def render_suggestions(self):
         """Render suggestion cards with voting options"""
         if st.session_state.current_suggestions:
             st.markdown("### Similar Statements")
-            st.markdown("If any of these statements match your intent, you can upvote them:")
+            st.markdown(
+                "If any of these statements match your intent, you can upvote them:"
+            )
 
             for idx, suggestion in enumerate(st.session_state.current_suggestions):
                 col1, col2 = st.columns([4, 1])
@@ -136,6 +155,7 @@ class MultimodalPolisApp:
     def run(self):
         """Main application entry point"""
         self.render_main_interface()
+
 
 if __name__ == "__main__":
     app = MultimodalPolisApp()

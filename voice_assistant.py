@@ -1,9 +1,21 @@
-from typing import Optional
+from typing import Optional, Union
 import requests
 from conversation_manager import ConversationManager
 from transcriber import TranscriptionService, WhisperTranscriber
 from text_to_speech import TextToSpeech
 from prompt_processor import PromptProcessor
+
+from enum import Enum
+
+
+class AssistantState(Enum):
+    IDLE = "Waiting to start..."
+    LISTENING = "Listening for your input..."
+    PROCESSING = "Processing your input..."
+    VERIFYING = "Please confirm if I understood correctly..."
+    COMPLETED = "Successfully captured your statement!"
+    FAILED = "Could not complete the interaction"
+
 
 class LLMClient:
     def __init__(self, api_key: str):
@@ -16,7 +28,7 @@ class LLMClient:
                 url=self.base_url,
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 json={
-                    "model": "qwen/qwen-2-7b-instruct:free",
+                    "model": "qwen/qwen-2.5-72b-instruct",
                     "messages": messages,
                 },
             )
@@ -26,6 +38,7 @@ class LLMClient:
             print(f"Error getting LLM response: {e}")
             return None
 
+
 class VoiceAssistant:
     def __init__(
         self,
@@ -33,16 +46,22 @@ class VoiceAssistant:
         tts_model_path: str,
         tts_config_path: str,
         use_gpu: bool = False,
+        state_callback=None,
     ):
+        self.state = AssistantState.IDLE
+        self.state_callback = state_callback
         self.llm_client = LLMClient(api_key)
         self.transcriber = TranscriptionService()
-        self.tts = TextToSpeech(use_gpu=use_gpu, model_path=tts_model_path, config_path=tts_config_path)
+        self.tts = TextToSpeech(
+            use_gpu=use_gpu, model_path=tts_model_path, config_path=tts_config_path
+        )
         self.conversation_history = []
         self.MAX_CLARIFICATION_TURNS = 3
 
     async def get_voice_input(self) -> Optional[str]:
         """Record and transcribe voice input."""
         result = await self.transcriber.transcribe_speech()
+        print(result)
         if not result.segments:
             return None
         return " ".join(segment.text for segment in result.segments)
@@ -60,110 +79,138 @@ class VoiceAssistant:
         response = response.lower()
         return "yes" in response or "correct" in response
 
-    async def process_voice_input(self) -> Optional[str]:
-        """Main processing loop for voice input and summary clarification."""
-        print("Speak...")
+    def set_state(self, state: AssistantState) -> None:
+        """Set the current state of the assistant."""
+        self.state = state
+        if self.state_callback:
+            self.state_callback(state)
 
-        # Get initial input
-        question = await self.get_voice_input()
-        if not question:
-            print("No speech detected!")
-            return None
+    async def process_voice_input(
+        self,
+    ) -> Optional[tuple[Union[str, None], AssistantState]]:
+        """Returns (final_statement, state) tuple"""
+        # Initial voice input
+        self.set_state(AssistantState.LISTENING)
+        initial_input = await self.get_voice_input()
+        if not initial_input:
+            self.set_state(AssistantState.FAILED)
+            return None, self.state
 
-        # Initialize conversation with system message and user's question
-        self.conversation_history = [
-            {"role": "user", "content": PromptProcessor.create_summary_prompt(question)}
-        ]
+        # Get initial summary from LLM
+        self.set_state(AssistantState.PROCESSING)
+        summary_prompt = PromptProcessor.create_summary_prompt(initial_input)
+        self.conversation_history = [{"role": "user", "content": summary_prompt}]
 
-        # First attempt - get initial summary
+        # Get initial LLM response before entering the loop
         llm_response = self.llm_client.get_response(self.conversation_history)
         if not llm_response:
-            print("Failed to get response from LLM")
-            return None
+            self.set_state(AssistantState.FAILED)
+            return None, self.state
 
-        summary_data = PromptProcessor.extract_yaml_content(llm_response)
-        if not summary_data or 'statement' not in summary_data:
-            print("Failed to parse LLM response")
-            return None
-
-        # Ask user to confirm the initial summary
-        confirmation_prompt = f"I understood that: {summary_data['statement']}. Is this correct?"
-        self.tts.speak(confirmation_prompt)
-
-        self.conversation_history.append(
-            {"role": "assistant", "content": confirmation_prompt}
-        )
-
-        confirmation = await self.get_voice_input()
-        if not confirmation:
-            return None
-
-        # Add user's confirmation response to history
-        self.conversation_history.append(
-            {"role": "user", "content": confirmation}
-        )
-
-        # Get LLM to evaluate the confirmation
-        llm_response = self.llm_client.get_response(self.conversation_history)
-        if not llm_response:
-            return None
-
-        confirmation_data = PromptProcessor.extract_yaml_content(llm_response)
-        if confirmation_data and confirmation_data.get('confirmed', False):
-            return summary_data['statement']
-
-        # If not confirmed, enter clarification loop
-        for attempt in range(self.MAX_CLARIFICATION_TURNS):
-            # Ask for clarification
-            confirmation_prompt = f"I understood that your statement is: {summary_data['statement']}. Is this correct?"
-            self.tts.speak(confirmation_prompt)
-            print("Please clarify...")
-
-            clarification = await self.get_voice_input()
-            if not clarification:
-                return None
-
-            # Add user's clarification to history
-            self.conversation_history.append(
-                {"role": "user", "content": PromptProcessor.create_summary_prompt(clarification)}
-            )
-
-            # Get new LLM response
-            llm_response = self.llm_client.get_response(self.conversation_history)
-            if not llm_response:
-                print("Failed to get response from LLM")
-                return None
-
+        attempts = 0
+        while attempts < self.MAX_CLARIFICATION_TURNS:
+            # Extract summary from current LLM response
             summary_data = PromptProcessor.extract_yaml_content(llm_response)
-            if not summary_data or 'statement' not in summary_data:
-                print("Failed to parse LLM response")
-                return None
+            if not summary_data or "statement" not in summary_data:
+                self.set_state(AssistantState.FAILED)
+                return None, self.state
 
-            # Ask user to confirm the new summary
-            confirmation_prompt = f"I understood that: {summary_data['statement']}. Is this correct?"
+            # Ask user for confirmation
+            self.set_state(AssistantState.VERIFYING)
+            confirmation_prompt = f"I understood your statement as: {summary_data['statement']}. Is this correct?"
             self.tts.speak(confirmation_prompt)
-            print(confirmation_prompt)
 
-            confirmation = await self.get_voice_input()
-            if not confirmation:
-                return None
+            # Get user's confirmation response
+            self.set_state(AssistantState.LISTENING)
+            user_confirmation = await self.get_voice_input()
+            if not user_confirmation:
+                self.set_state(AssistantState.FAILED)
+                return None, self.state
 
-            # Add user's confirmation response to history
-            self.conversation_history.append(
-                {"role": "user", "content": confirmation}
+            # Ask LLM to verify user's response and potentially modify statement
+            verification_prompt = (
+                f"Based on the my response: '{user_confirmation}', provide a YAML response with:\n"
+                "'statement': the original statement if confirmed, or a modified version based on feedback\n"
+                "'confirmed': true if I confirmed, false if requested changes or need clarification"
             )
 
-            # Get LLM to evaluate the confirmation
+            self.conversation_history.append(
+                {"role": "assistant", "content": llm_response}
+            )
+            self.conversation_history.append(
+                {"role": "user", "content": verification_prompt}
+            )
+
+            # Get LLM's verification and potential modification
             llm_response = self.llm_client.get_response(self.conversation_history)
             if not llm_response:
-                return None
+                self.set_state(AssistantState.FAILED)
+                return None, self.state
 
-            confirmation_data = PromptProcessor.extract_yaml_content(llm_response)
-            if confirmation_data and confirmation_data.get('confirmed', False):
-                return summary_data['statement']
+            # Check if user confirmed
+            verification_data = PromptProcessor.extract_yaml_content(llm_response)
+            if verification_data and verification_data.get("confirmed", False):
+                self.set_state(AssistantState.COMPLETED)
+                return verification_data["statement"], self.state
 
-        self.tts.speak(
-            "I'm still having trouble understanding completely. "
-            "Let's start over with a new question."
+            attempts += 1
+
+        self.set_state(AssistantState.FAILED)
+        return None, self.state
+
+    async def process_text_input(
+        self, text_input: str
+    ) -> Optional[tuple[Union[str, None], AssistantState]]:
+        """Process text input similar to voice input"""
+        self.set_state(AssistantState.PROCESSING)
+
+        # Create initial summary prompt
+        summary_prompt = PromptProcessor.create_summary_prompt(text_input)
+        self.conversation_history = [{"role": "user", "content": summary_prompt}]
+
+        # Get initial LLM response
+        llm_response = self.llm_client.get_response(self.conversation_history)
+        if not llm_response:
+            self.set_state(AssistantState.FAILED)
+            return None, self.state
+
+        attempts = 0
+        while attempts < self.MAX_CLARIFICATION_TURNS:
+            # Extract summary from current LLM response
+            summary_data = PromptProcessor.extract_yaml_content(llm_response)
+            if not summary_data or "statement" not in summary_data:
+                self.set_state(AssistantState.FAILED)
+                return None, self.state
+
+            # Set verification state
+            self.set_state(AssistantState.VERIFYING)
+
+            # Return the current statement and state for UI confirmation
+            return summary_data["statement"], self.state
+
+        self.set_state(AssistantState.FAILED)
+        return None, self.state
+
+    def process_confirmation(
+        self, statement: str, is_confirmed: bool
+    ) -> Optional[tuple[str, bool]]:
+        """Process user confirmation response"""
+        verification_prompt = (
+            f'Does this statement imply confirmation? {"yes" if is_confirmed else "no"}\n'
+            f'Use the same YAML format with "confirmed" and "statement" keys.'
         )
-        return None
+
+        self.conversation_history.append(
+            {"role": "user", "content": verification_prompt}
+        )
+        verify_response = self.llm_client.get_response(self.conversation_history)
+
+        if not verify_response:
+            return None, False
+
+        confirmation_data = PromptProcessor.extract_yaml_content(verify_response)
+        if confirmation_data and confirmation_data.get("confirmed", False):
+            self.set_state(AssistantState.COMPLETED)
+            return statement, True
+
+        return None, False
