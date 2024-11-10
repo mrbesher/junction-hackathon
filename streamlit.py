@@ -4,11 +4,13 @@ from typing import List, Optional
 import asyncio
 from pathlib import Path
 import tempfile
+import requests
 import yaml
 
 from voice_assistant import VoiceAssistant
 from components import StatementDisplay
 
+RAG_URL = "http://127.0.0.1:5000/post-data"
 
 @dataclass
 class Message:
@@ -21,16 +23,15 @@ class Statement:
     votes: int = 0
     id: str = ""
 
-class DummyRAGService:
-    """Temporary RAG implementation"""
+class RAGService:
+    """ RAG implementation"""
     def get_similar_statements(self, query: str) -> List[str]:
-        import random
-        statements = [
-            "We should improve public transportation",
-            "Healthcare should be more accessible",
-            "Education needs more funding"
-        ]
-        return random.choices(statements, k=3) if random.random() > 0.5 else []
+        response = requests.post(
+                RAG_URL,
+                params={"text": query},  
+                timeout=10
+            )
+        return response.json()
 
 class SessionState:
     def __init__(self):
@@ -51,7 +52,7 @@ class MultimodalPolisApp:
             tts_model_path="/home/besher/Documents/tools/piper/en_US-ljspeech-high.onnx",
             tts_config_path="/home/besher/Documents/tools/piper/en_en_US_ljspeech_high_en_US-ljspeech-high.onnx.json"
         )
-        self.rag_service = DummyRAGService()
+        self.rag_service = RAGService()
         self.statement_display = StatementDisplay()
 
     async def process_text_input(self, text_input: str) -> None:
@@ -77,7 +78,7 @@ class MultimodalPolisApp:
             if final_statement:
                 similar_statements = self.rag_service.get_similar_statements(final_statement)
                 st.session_state.current_suggestions = [
-                    Statement(text=stmt) for stmt in similar_statements
+                    Statement(text=stmt["text"], id= stmt["hit_id"]) for stmt in similar_statements
                 ]
                 st.session_state.messages.append({
                     "role": "user",
